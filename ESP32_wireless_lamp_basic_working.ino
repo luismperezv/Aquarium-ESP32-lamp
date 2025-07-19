@@ -17,6 +17,7 @@ const int ledPin1 = 3;
 const int ledPin2 = 4;
 const int buttonUp = 7;
 const int buttonDown = 0;
+const int wifiStatusLed = 8;
 
 int brightness1 = 128;
 int brightness2 = 128;
@@ -48,12 +49,16 @@ Mode mode = NORMAL;
 unsigned long lastInteraction = 0;
 const unsigned long modeTimeout = 90000;
 
+unsigned long lastWifiBlink = 0;
+bool wifiLedState = false;
+
 void setup() {
   delay(1000);
   Serial.begin(115200);
 
   pinMode(buttonUp, INPUT_PULLUP);
   pinMode(buttonDown, INPUT_PULLUP);
+  pinMode(wifiStatusLed, OUTPUT);
 
   ledcAttach(ledPin1, 5000, 8);
   ledcAttach(ledPin2, 5000, 8);
@@ -65,12 +70,14 @@ void setup() {
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+    updateWifiLed();
+    delay(10);
+    yield();
   }
   Serial.println();
   Serial.print("Connected! IP address: ");
   Serial.println(WiFi.localIP());
+  digitalWrite(wifiStatusLed, LOW);  // Solid ON (active-low fix)
 
   server.on("/", handleRoot);
   server.on("/up", []() {
@@ -104,6 +111,7 @@ void loop() {
   handleButton(upBtn, true);
   handleButton(downBtn, false);
   checkFineTuneTimeout();
+  updateWifiLed();
   server.handleClient();
 }
 
@@ -252,6 +260,17 @@ void exitFineTuneMode() {
 void checkFineTuneTimeout() {
   if ((mode == TUNE1 || mode == TUNE2) && millis() - lastInteraction > modeTimeout) {
     exitFineTuneMode();
+  }
+}
+
+void updateWifiLed() {
+  unsigned long now = millis();
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(wifiStatusLed, LOW);  // ON (active-low)
+  } else if (now - lastWifiBlink >= 500) {
+    wifiLedState = !wifiLedState;
+    digitalWrite(wifiStatusLed, wifiLedState ? LOW : HIGH);  // Blink (active-low)
+    lastWifiBlink = now;
   }
 }
 
