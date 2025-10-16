@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <time.h>  // time for Natural Light Cycle (NLC)
 
 const char* ssid = "FHCPE-c9S4";
 const char* password = "UpmcXfh6";
@@ -13,6 +14,7 @@ IPAddress secondaryDNS(8, 8, 8, 8);
 
 WebServer server(80);
 
+// NOTE: Keeping your existing pins as requested
 const int ledPin1 = 3;
 const int ledPin2 = 4;
 const int buttonUp = 7;
@@ -52,6 +54,87 @@ const unsigned long modeTimeout = 90000;
 unsigned long lastWifiBlink = 0;
 bool wifiLedState = false;
 
+// ===================== Natural Light Cycle (NLC) =====================
+bool naturalCycleEnabled = true;      // ON by default at boot
+unsigned long lastUserOverride = 0;   // millis of last manual interaction (0 = none yet)
+int overrideMinutes = 120;            // configurable in UI; default 120 minutes
+
+// Slew control for smooth transitions
+unsigned long lastSlew = 0;
+const unsigned long slewIntervalMs = 200;  // update every 200ms
+const int slewStep = 3;                    // max PWM change per tick
+
+// On first valid time after boot, jump instantly to target once
+bool nlcInitialApplied = false;
+
+inline unsigned long overrideWindowMs() {
+  // clamp to 1..480 minutes for sanity
+  int m = constrain(overrideMinutes, 1, 480);
+  return (unsigned long)m * 60UL * 1000UL;
+}
+
+inline void markUserOverride() { lastUserOverride = millis(); }
+
+int localMinutes() {
+  struct tm t;
+  if (!getLocalTime(&t, 10)) return -1;
+  return t.tm_hour * 60 + t.tm_min;
+}
+
+// 08:00..23:00 sinusoidal hump (0 outside window)
+int naturalTargetBrightness() {
+  int mins = localMinutes();
+  if (mins < 0) return -1;
+  const int startM = 8 * 60;   // 08:00
+  const int endM   = 23 * 60;  // 23:00
+  if (mins < startM || mins >= endM) return 0;
+
+  float t = float(mins - startM) / float(endM - startM); // 0..1
+  float b = sinf(t * 3.1415926f); // smooth 0..1..0
+  float g = powf(fmaxf(0.f, b), 1.2f); // gentle gamma
+  int target = (int)roundf(g * 255.0f);
+  if (target > 240) target = 240; // keep under max for softness
+  return target;
+}
+
+void serviceNaturalCycle() {
+  if (!naturalCycleEnabled) return;
+
+  // If we've had a manual change recently, respect the override window
+  if (lastUserOverride != 0 && (millis() - lastUserOverride < overrideWindowMs())) return;
+
+  int target = naturalTargetBrightness();
+  if (target < 0) return; // time not ready yet
+
+  // First time after time becomes valid: jump instantly to target (per your request)
+  if (!nlcInitialApplied) {
+    brightness1 = target;
+    brightness2 = target;
+    updateLEDs();
+    nlcInitialApplied = true;
+    return;
+  }
+
+  // Afterwards, slew gently toward the target
+  unsigned long now = millis();
+  if (now - lastSlew < slewIntervalMs) return;
+  lastSlew = now;
+
+  auto slewOne = [&](int &b) {
+    if (b < target)      b = min(target, b + slewStep);
+    else if (b > target) b = max(target, b - slewStep);
+  };
+
+  int before1 = brightness1, before2 = brightness2;
+  slewOne(brightness1);
+  slewOne(brightness2);
+
+  if (brightness1 != before1 || brightness2 != before2) {
+    updateLEDs();
+  }
+}
+// ====================================================================
+
 void setup() {
   delay(1000);
   Serial.begin(115200);
@@ -60,9 +143,10 @@ void setup() {
   pinMode(buttonDown, INPUT_PULLUP);
   pinMode(wifiStatusLed, OUTPUT);
 
+  // Keep your original LEDC calls as-is
   ledcAttach(ledPin1, 5000, 8);
   ledcAttach(ledPin2, 5000, 8);
-  updateLEDs();
+  updateLEDs();  // starts at 128/128
 
   if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
     Serial.println("⚠️ Failed to configure static IP");
@@ -79,6 +163,14 @@ void setup() {
   Serial.println(WiFi.localIP());
   digitalWrite(wifiStatusLed, LOW);  // Solid ON (active-low fix)
 
+  // Time setup for London (GMT/BST)
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0/2", 1); // London time rules
+  tzset();
+  // Try to fetch time quickly (best-effort, non-fatal)
+  struct tm tmnow;
+  for (int i = 0; i < 20 && !getLocalTime(&tmnow, 50); i++) { delay(50); }
+
   server.on("/", handleRoot);
   server.on("/up", []() {
     adjustBrightness(true);
@@ -92,19 +184,21 @@ void setup() {
   });
   server.on("/toggle1", []() {
     led1Enabled = !led1Enabled;
+    markUserOverride();
     updateLEDs();
     server.sendHeader("Location", "/");
     server.send(303);
   });
   server.on("/toggle2", []() {
     led2Enabled = !led2Enabled;
+    markUserOverride();
     updateLEDs();
     server.sendHeader("Location", "/");
     server.send(303);
   });
   server.on("/state", HTTP_GET, handleState);
   server.on("/set", HTTP_POST, handleSet);
-  server.on("/favicon.ico", HTTP_GET, [](){ server.send(204); }); 
+  server.on("/favicon.ico", HTTP_GET, [](){ server.send(204); });
   server.on("/cmd", HTTP_POST, handleCmd);
 
   server.begin();
@@ -116,6 +210,7 @@ void loop() {
   handleButton(downBtn, false);
   checkFineTuneTimeout();
   updateWifiLed();
+  serviceNaturalCycle(); // drive schedule
   server.handleClient();
 }
 
@@ -179,6 +274,7 @@ void handleButton(Button &btn, bool isUp) {
 }
 
 void adjustBrightness(bool isIncrease) {
+  markUserOverride();
   int old1 = brightness1;
   int old2 = brightness2;
 
@@ -201,6 +297,7 @@ void adjustBrightness(bool isIncrease) {
 }
 
 void adjustChannelBrightness(int channel, bool isIncrease) {
+  markUserOverride();
   int &b = (channel == 1) ? brightness1 : brightness2;
   int oldBrightness = b;
   b = constrain(b + (isIncrease ? step : -step), 0, 255);
@@ -289,9 +386,9 @@ void handleRoot() {
   <style>
     :root { color-scheme: light dark; }
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; line-height: 1.3; }
-    .card { max-width: 560px; padding: 16px; border-radius: 14px; box-shadow: 0 2px 12px rgba(0,0,0,.1); margin: auto; }
+    .card { max-width: 620px; padding: 16px; border-radius: 14px; box-shadow: 0 2px 12px rgba(0,0,0,.1); margin: auto; }
     h1 { margin: 0 0 12px; font-size: 1.4rem; }
-    .row { display: grid; grid-template-columns: 110px 1fr auto; gap: 10px; align-items: center; margin: 14px 0; }
+    .row { display: grid; grid-template-columns: 140px 1fr auto; gap: 10px; align-items: center; margin: 14px 0; }
     .muted { opacity: .7; font-size: .9rem; }
     input[type=range] { width: 100%; }
     .switch { display:inline-flex; align-items:center; gap:8px; }
@@ -301,13 +398,15 @@ void handleRoot() {
     .err { color: #c22; }
     .small { font-size:.85rem; }
     .pill { padding:2px 8px; border-radius:999px; border:1px solid #aaa4; }
+    input[type=number]{ width: 80px; padding:6px 8px; border-radius:8px; border:1px solid #aaa4; }
+    .inline{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>LED Lamp Control</h1>
     <div class="muted small">
-      IP: <span id="ip">…</span> • Wi‑Fi: <span id="wifi">…</span>
+      IP: <span id="ip">…</span> • Wi-Fi: <span id="wifi">…</span>
       • Mode: <span id="mode">NORMAL</span>
     </div>
 
@@ -338,10 +437,20 @@ void handleRoot() {
       <button onclick="cmd('down')">- (both)</button>
       <button onclick="cmd('toggle1')">Toggle LED1</button>
       <button onclick="cmd('toggle2')">Toggle LED2</button>
+      <button id="nlcbtn" onclick="toggleNLC()">Natural cycle: Off</button>
       <span id="status" class="pill muted">idle</span>
     </div>
 
-    <p class="muted small">Tip: sliders update on release; toggles are instant. The old button routes still work.</p>
+    <div class="row">
+      <div>Override duration</div>
+      <div class="inline">
+        <input id="ovr" type="number" min="1" max="480" step="1"/>
+        <button onclick="saveOverride()">Save</button>
+      </div>
+      <div class="muted small">minutes</div>
+    </div>
+
+    <p class="muted small">Tip: sliders update on release; toggles are instant. NLC is on by default after boot: lights start at 128 and jump to the correct level once time sync succeeds.</p>
   </div>
 
 <script>
@@ -365,6 +474,8 @@ async function fetchState() {
     $("wifi").textContent = j.wifi ? "Connected" : "Disconnected";
     $("wifi").className = j.wifi ? "ok" : "warn";
     $("mode").textContent = j.mode || "NORMAL";
+    $("nlcbtn").textContent = "Natural cycle: " + (j.nlc ? "On" : "Off");
+    $("ovr").value = j.override_min ?? 120;
     lastState = j;
   } catch(e) {
     setStatus("state error", "err");
@@ -410,6 +521,16 @@ const sendSet = debounce(()=> {
 
 async function cmd(a){ await postForm('/cmd', {a}); }
 
+async function toggleNLC(){
+  const turningOn = $("nlcbtn").textContent.includes("Off");
+  await postForm('/set', { nlc: turningOn ? 1 : 0 });
+}
+
+async function saveOverride(){
+  const v = Math.max(1, Math.min(480, parseInt($("ovr").value||"120",10)));
+  await postForm('/set', { override_min: v });
+}
+
 fetchState();
 setInterval(fetchState, 1500);
 </script>
@@ -426,6 +547,8 @@ void handleState() {
   s += "\"e1\":" + String(led1Enabled ? "true":"false") + ",";
   s += "\"e2\":" + String(led2Enabled ? "true":"false") + ",";
   s += "\"wifi\":" + String(WiFi.status() == WL_CONNECTED ? "true":"false") + ",";
+  s += "\"nlc\":" + String(naturalCycleEnabled ? "true":"false") + ",";
+  s += "\"override_min\":" + String(overrideMinutes) + ",";
   s += "\"mode\":\"" + String(
         mode == NORMAL ? "NORMAL" : (mode == TUNE1 ? "TUNE1" : "TUNE2")) + "\",";
   s += "\"ip\":\"" + (WiFi.isConnected() ? WiFi.localIP().toString() : String("")) + "\"";
@@ -433,12 +556,11 @@ void handleState() {
   server.send(200, "application/json", s);
 }
 
-// Accepts POST form or query string: b1,b2 (0-255), e1,e2 (0/1)
+// Accepts POST form: b1,b2 (0-255), e1,e2 (0/1), nlc (0/1), override_min (1..480)
 void handleSet() {
-  // Prefer POST body; fall back to query args
   auto getArg = [&](const String& name)->String{
     if (server.hasArg(name)) return server.arg(name);
-    String v = server.arg(name); // works for either with WebServer
+    String v = server.arg(name);
     return v;
   };
 
@@ -460,13 +582,34 @@ void handleSet() {
     bool v = getArg("e2").toInt() != 0;
     if (v != led2Enabled) { led2Enabled = v; changed = true; }
   }
+  if (getArg("nlc").length()) {
+    bool v = getArg("nlc").toInt() != 0;
+    if (v != naturalCycleEnabled) {
+      naturalCycleEnabled = v;
+      // If turning NLC on, allow immediate control by schedule unless user acts
+      if (naturalCycleEnabled) {
+        nlcInitialApplied = false;    // re-apply on next valid time
+        // Do not set lastUserOverride here; we want NLC to take over
+      }
+    }
+  }
+  if (getArg("override_min").length()) {
+    int v = getArg("override_min").toInt();
+    v = constrain(v, 1, 480);
+    overrideMinutes = v;
+    // no brightness change; no markUserOverride()
+  }
 
-  if (changed) updateLEDs();
+  if (changed) {
+    markUserOverride(); // manual change
+    updateLEDs();
+  }
   server.send(200, "text/plain", "OK");
 }
 
 void handleCmd() {
   String a = server.arg("a");  // expects: up | down | toggle1 | toggle2
+  markUserOverride();
   if (a == "up") {
     adjustBrightness(true);
   } else if (a == "down") {
@@ -480,4 +623,3 @@ void handleCmd() {
   }
   server.send(200, "text/plain", "OK");
 }
-
